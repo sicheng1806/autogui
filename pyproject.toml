@@ -4,4 +4,63 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "click>=8.4.1",
+    "ddddocr>=1.6.1",
+    "numpy>=2.5.0",
+    "pillow>=12.2.0",
+    "pyautogui>=0.9.54",
+    "uiautomation>=2.0.29",
+    "uiautomator2>=3.5.2",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "ipython>=9.14.0",
+    "pytest>=9.1.1",
+    "uiautodev>=0.14.0",
+]
+
+[project.scripts]
+damai = "autogui.bin.damai:cli"
+
+[build-system]
+requires = ["uv_build>=0.9.17,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "F",     # pyflakes
+    "I",     # isort
+    "N",     # pep8-naming
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "SIM",   # flake8-simplify
+    "C4",    # flake8-comprehensions
+    "RUF",   # ruff 专用规则
+    "TCH",   # flake8-type-checking（避免循环导入）
+    "PTH",   # flake8-use-pathlib
+    "FA",    # flake8-future-annotations
+    "LOG"
+]
+ignore = [
+    "RUF002",
+    "RUF001"
+]
+
+[tool.ruff.format]
+line-ending = "lf"
+
+[tool.ty.terminal]
+error-on-warning = true
+
+[tool.ty.rules]
+# Strict from day 1 for new projects
+possibly-unresolved-reference = "error"
+unused-ignore-comment = "warn"
