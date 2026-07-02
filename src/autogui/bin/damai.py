@@ -1,51 +1,31 @@
 """基于大麦应用自动化抢票
 
-# 进展
-
-由于抢票模型的天然难预测性，难以编码各种突发情况，而且样本量极少，因此目前代码只能够在理想环境下正常运行，会出现一些操作无法真正实现的问题：
-- 选票过程中按钮状态突然变化，导致点击无效卡住
-- 按钮点击无效，没有合适的确认手段
-- 由于抢票要求的低时延性，导致其并不适合用UI自动化来进行，因为UI自动化的各个操作都是及其费时的，例如
-  每次定位元素(200-300ms)、每次点击(100ms)、等待页面加载，其效率甚至不如专注的人手动操作，UI自动化
-  可用于对时间不敏感、状态确定的操作中。
-  因此该项目难以有实际用途，其更多的作用是提供了一种组织多页面自动化的方法，也演示了实际UI自动化脚本的大致样貌。
-
 # 特性
 - [x] 选票失败时自动返回页面重选
 - [x] 最大重试次数
-- [ ] 选票场次限制: 暂不知道如何实现（可以通过
-    '(//*[@resource-id="cn.damai:id/layout_perform_view"]//*[@resource-id="cn.damai:id/ll_perform_item"])[1]
-    [not(descendant::*[@text="无票"])]'
-    的存在性来逐个判断，但效率极低
-- [ ] 选票最高档位限制: 同上
+- [ ] 选票场次限制
+- [ ] 选票最高档位限制
 
-# 实现方式
-- 通过 uiautomator2 在售票界面执行操作
-- 界面有：售票 -> 选票 -> 购票 -> 支付
-- 核心逻辑为:
-  - 售票界面:等待抢票开始
-  - 选票界面:选择场次、票价和购票数
-  - 购票界面:选择购票人跳转到支付界面
-  - 支付界面:只需确认跳转到支付界面即可，后续操作有用户执行
-- 程序按界面(Page)进行组织，界面元素定位涉及到的资源按枚举组织，定位元素的方法通过property组织，具体页面逻辑通过方法组织
-- 由于抢票是是耗时要求极低的场景，因此必须经可能减少元素操作，在一定情况下允许绕开程序逻辑，进行直通式操作
-- 必要的元素操作:
-  - 确认页面是否已经加载
-  - 弹窗处理
-  - 跳转到下一个窗口的操作
-- 不必要的操作只有在直通逻辑无法实行的情况下执行
-  - 选择场次
-  - 选择票价
-  - 选择票数
-  - 选择用户
-  - 确认当前购票总价
-- 什么不做:
-  - 不引入基于图像识别的操作，即使会影响通用性
-  - 不做完全逻辑可靠的交互过程，最小化耗时
-  - 不做日志，小脚本没必要，打印信息通过页面的_print_xx方法
+# 设计约定
+- 按页面(Page)组织界面逻辑
+- 元素定位资源用枚举管理，定位方法通过 property 组织
+- 抢票是低时延场景，因此必须尽可能减少元素操作次数
+  - 必要的操作：确认页面加载、弹窗处理、页面跳转
+  - 不必要的操作只有在直通逻辑无法实行时才执行：选择场次/票价/票数/用户
+- 异常用作控制流（NoTicketsError 等），不在业务路径上返回错误码
+- 不引入图像识别，不做完整的状态验证
+- 关键路径上保留时间戳日志以备调试
+
+# 已知局限
+- 选票过程中按钮状态可能突变，导致点击后无反馈也不跳转
+- uiautomator2 的 xpath 定位约 200-300ms，是耗时瓶颈
+- 每次额外元素操作（如逐一检查场次有票）会拖慢路径，得不偿失
+- 当前仅在理想环境下测试通过
 """
 
+import logging
 import re
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 from enum import StrEnum
@@ -53,6 +33,15 @@ from typing import override
 
 import click
 import uiautomator2 as u2
+
+logger = logging.getLogger(__name__)
+_start_time: float = 0.0
+
+
+def _log(msg: str):
+    elapsed = time.monotonic() - _start_time if _start_time else 0.0
+    logger.info("[%.3f] %s", elapsed, msg)
+
 
 MAX_RETRIES = 10
 
@@ -120,6 +109,7 @@ class SellPage(_Page):
 
         此方法可以接受大时延，因为抢票还未开始
         """
+        _log("售票页: 等待开售")
         time_popup = self.time_popup
         if time_popup.exists():
             sell_time = time_popup.child_selector(resourceId=self.Resource.SellTimeText).get_text()
@@ -146,8 +136,10 @@ class SellPage(_Page):
                 self._print_waiting_for_sell(sell_time=sell_time)
                 selling = self.time_popup.wait_gone(timeout=timeout)
                 self.device.click(100, 50)  # 保持页面激活
+        _log("售票页: 开售已开始")
 
     def confirm(self):
+        _log("售票页: 点击确认按钮")
         self.confirm_button.click()
         return SelectPage(self.device)
 
@@ -245,9 +237,13 @@ class SelectPage(_Page):
     def confirm(self):
         # FIXME: 缺少无票检测的逻辑
         if not self.selector(resourceId=self.Resource.NumLayout).exists():
+            _log("选票页: 首次进入，需要选场次/票价/票数")
             self.choose_perform()
             self.choose_ticket()
             self.choose_ticket_num()
+        else:
+            _log("选票页: 直通模式，跳过选票直接确认")
+        _log("选票页: 点击确认按钮")
         self.confirm_btn.click()
         return BuyPage(self.device)
 
@@ -256,6 +252,7 @@ class SelectPage(_Page):
         if not len(performs):
             raise NoTicketsError("所有场次都无票")
         performs_idx = self.perform if self.perform < len(performs) else 0
+        _log(f"选票页: 选择场次 #{performs_idx}")
         performs[performs_idx].click()
 
     def choose_ticket(self):
@@ -263,11 +260,13 @@ class SelectPage(_Page):
         if not len(tickets):
             raise NoTicketsError("暂无可售票")
         ticket_idx = self.ticket if self.perform < len(tickets) else 0
+        _log(f"选票页: 选择票价档位 #{ticket_idx}")
         tickets[ticket_idx].click()
 
     def choose_ticket_num(self):
         current_num = self.current_ticket_number
         expect_num = self.ticket_num
+        _log(f"选票页: 当前票数={current_num}, 期望票数={expect_num}")
         if expect_num > current_num:
             for _ in range(expect_num - current_num):
                 self.selector(resourceId=self.Resource.PlusTicketButton).click()
@@ -280,6 +279,7 @@ class SelectPage(_Page):
             raise NoTicketsError(f"没有足够票额，当前票数: {current_num}")
 
     def back(self):
+        _log("选票页: 返回上一页")
         self.selector(resourceId=self.Resource.BackButton).click()
         return SellPage(self.device)
 
@@ -338,28 +338,35 @@ class BuyPage(_Page):
         for checkbox in checkboxs:
             # FIXME: 这里点击可能会失败,暂不知道原因
             if checkbox.attrib["checked"] != "true":
+                _log(f"购票页: 勾选购票人 {checkbox.attrib.get('text', '')}")
                 checkbox.click()
 
     def skip_popup(self):
         dialog = self.dialog
         if dialog.exists():
+            _log("购票页: 关闭弹窗")
             dialog.child_selector(resourceId=self.Resource.DialogConfirmButton).click()
 
     def confirm(self, max_retries=MAX_RETRIES):
+        _log("购票页: 开始确认购票")
         self.choose_audiences()
         pay_page = PayPage(self.device)
-        for _ in range(max_retries):
+        for i in range(max_retries):
+            _log(f"购票页: 第{i + 1}次点击提交按钮")
             self.confirm_button.wait()
             self.confirm_button.click()
             for _ in range(max_retries):
-                if pay_page.wait(0.1):
+                if pay_page.wait(0.3):
+                    _log("购票页: 成功跳转到支付页")
                     return pay_page
-                elif self.dialog.wait(exists=True, timeout=0.1):
+                elif self.dialog.wait(exists=True, timeout=0.3):
+                    _log("购票页: 检测到弹窗")
                     self.skip_popup()
                     break
         raise MaxReretriesError("购票失败, 超过最大重试次数")
 
     def back(self):
+        _log("购票页: 返回上一页")
         self.selector(resourceId=self.Resource.BackButton).click()
         return SelectPage(self.device)
 
@@ -368,17 +375,28 @@ class PayPage(_Page):
     name = "支付"
 
     def wait(self, timeout: None | float = None) -> bool:
-        return self.selector(resourceId="com.alipay.android.app:id/flybird_layout").wait(exists=True, timeout=timeout)
+        exists = self.selector(resourceId="com.alipay.android.app:id/flybird_layout").wait(exists=True, timeout=timeout)
+        if exists:
+            _log("支付页: 已检测到支付界面")
+        else:
+            _log("支付页: 等待超时")
+        return exists
 
 
 def run(
     audiences: list[str], available_perform_idx: int = 0, available_ticket_idx: int = 0, max_retries: int = MAX_RETRIES
 ):
+    global _start_time
+    _start_time = time.monotonic()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
+
     device = u2.connect()
     sell_page = SellPage(device=device)
+    _log("程序启动，等待用户手动跳转到售票页面")
     print("售票程序已开启：请手动转跳到演唱会售票页面")
     sell_page.wait()
     print(f"===\t{sell_page.title}\t===")
+    _log(f"当前演唱会: {sell_page.title}")
     # 等待起售
     select_page = _wait_for_sell(sell_page)
     buy_page = _select_perform_and_ticket(
@@ -396,6 +414,7 @@ def run(
             pay_page = buy_page.confirm(max_retries)
             break
         except MaxReretriesError:
+            _log("购票页: 多次重试后失败，返回选票页重新选票")
             print("多次购买后失败，重新选票")
             select_page = buy_page.back()
             buy_page = _select_perform_and_ticket(
@@ -405,10 +424,12 @@ def run(
                 available_ticket_idx=available_ticket_idx,
             )
     pay_page.wait()
+    _log("支付页: 购买成功，等待用户手动支付")
     print("购买成功")
 
 
 def _wait_for_sell(page: SellPage):
+    _log("进入等待开售流程")
     page.wait()
     page.wait_for_sell()
     return page.confirm()
@@ -417,6 +438,7 @@ def _wait_for_sell(page: SellPage):
 def _select_perform_and_ticket(
     select_page: SelectPage, ticket_number: int, available_perform_idx: int = 0, available_ticket_idx: int = 0
 ):
+    _log("进入选票流程")
     while True:
         select_page.wait()
         select_page.set_perform(available_perform_idx)
@@ -425,6 +447,7 @@ def _select_perform_and_ticket(
         try:
             return select_page.confirm()
         except NoTicketsError:
+            _log("选票页: 无票，返回重试")
             print("未找到合适票型")
             sell_page = select_page.back()
             sell_page.wait()
