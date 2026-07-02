@@ -1,5 +1,24 @@
 """基于大麦应用自动化抢票
 
+# 进展
+
+由于抢票模型的天然难预测性，难以编码各种突发情况，而且样本量极少，因此目前代码只能够在理想环境下正常运行，会出现一些操作无法真正实现的问题：
+- 选票过程中按钮状态突然变化，导致点击无效卡住
+- 按钮点击无效，没有合适的确认手段
+- 由于抢票要求的低时延性，导致其并不适合用UI自动化来进行，因为UI自动化的各个操作都是及其费时的，例如
+  每次定位元素(200-300ms)、每次点击(100ms)、等待页面加载，其效率甚至不如专注的人手动操作，UI自动化
+  可用于对时间不敏感、状态确定的操作中。
+  因此该项目难以有实际用途，其更多的作用是提供了一种组织多页面自动化的方法，也演示了实际UI自动化脚本的大致样貌。
+
+# 特性
+- [x] 选票失败时自动返回页面重选
+- [x] 最大重试次数
+- [ ] 选票场次限制: 暂不知道如何实现（可以通过
+    '(//*[@resource-id="cn.damai:id/layout_perform_view"]//*[@resource-id="cn.damai:id/ll_perform_item"])[1]
+    [not(descendant::*[@text="无票"])]'
+    的存在性来逐个判断，但效率极低
+- [ ] 选票最高档位限制: 同上
+
 # 实现方式
 - 通过 uiautomator2 在售票界面执行操作
 - 界面有：售票 -> 选票 -> 购票 -> 支付
@@ -35,6 +54,8 @@ from typing import override
 import click
 import uiautomator2 as u2
 
+MAX_RETRIES = 10
+
 
 class ParseTimeError(Exception):
     def __init__(self, sell_time: str) -> None:
@@ -45,7 +66,13 @@ class ParseTimeError(Exception):
 class StateError(Exception):
     """交互界面状态错误时触发"""
 
-    pass
+
+class MaxReretriesError(Exception):
+    """超过最大重试次数时触发"""
+
+
+class NoTicketsError(Exception):
+    """当没有选票时触发"""
 
 
 class _Page(ABC):
@@ -53,7 +80,6 @@ class _Page(ABC):
 
     def __init__(self, device: u2.Device) -> None:
         self.device = device or u2.connect()
-        print(f"进入{self.name}界面")
 
     @abstractmethod
     def wait(self, timeout: float | None = None) -> bool: ...
@@ -72,15 +98,10 @@ def damai_id(id: str):
 class SellPage(_Page):
     name = "售票"
 
-    def __init__(self, device: u2.Device) -> None:
-        super().__init__(device)
-        print("请跳转到演唱会页面以开始抢票")
-
     class Resource(StrEnum):
         ConfirmButton = damai_id("trade_project_detail_purchase_status_bar_container_fl")
         TimePopup = damai_id("project_item_bottom_time_stagory")
         SellTimeText = damai_id("id_project_count_sell_time")
-        Title = damai_id("")
 
     @property
     def confirm_button(self):
@@ -92,11 +113,7 @@ class SellPage(_Page):
 
     @override
     def wait(self, timeout: float | None = None) -> bool:
-        res = self.confirm_button.wait(exists=True)
-        if res:
-            self._print_title()
-            return True
-        return False
+        return self.confirm_button.wait(exists=True)
 
     def wait_for_sell(self):
         """等待开售
@@ -134,8 +151,9 @@ class SellPage(_Page):
         self.confirm_button.click()
         return SelectPage(self.device)
 
-    def _print_title(self):
-        title = "".join(
+    @property
+    def title(self):
+        return "".join(
             [
                 ele.text
                 for ele in self.xpath(
@@ -143,8 +161,6 @@ class SellPage(_Page):
                 ).all()
             ]
         )
-
-        print(f"演唱会:\t{title}")
 
     @staticmethod
     def _print_wait_for_sell(sell_time):
@@ -180,6 +196,8 @@ class SelectPage(_Page):
         PlusTicketButton = damai_id("img_jia")
         SubTicketButton = damai_id("img_jian")
 
+        BackButton = damai_id("title_back_btn")
+
     def __init__(self, device: u2.Device) -> None:
         super().__init__(device)
         self.perform = 0
@@ -203,13 +221,14 @@ class SelectPage(_Page):
     def available_performs(self):
         return self.xpath(
             f'//*[@resource-id="{self.Resource.PerformLayout}"]//*[@resource-id="{self.Resource.Item}"]'
+            '[not(descendant::*[@text="无票"])]'
         ).all()
 
     @property
     def available_tickets(self):
         return self.xpath(
             f'//*[@resource-id="{self.Resource.PriceLayout}"]//*[@resource-id="{self.Resource.Item}"]'
-            f'[not(descendant::*[@text="缺货登记"])]'
+            '[not(descendant::*[@text="缺货登记"])]'
         ).all()
 
     @property
@@ -224,6 +243,7 @@ class SelectPage(_Page):
         return bool(self.confirm_btn.wait(exists=True, timeout=timeout))
 
     def confirm(self):
+        # FIXME: 缺少无票检测的逻辑
         if not self.selector(resourceId=self.Resource.NumLayout).exists():
             self.choose_perform()
             self.choose_ticket()
@@ -233,14 +253,16 @@ class SelectPage(_Page):
 
     def choose_perform(self):
         performs = self.available_performs
-        performs_idx = self.perform if len(performs) <= self.perform + 1 else 0
+        if not len(performs):
+            raise NoTicketsError("所有场次都无票")
+        performs_idx = self.perform if self.perform < len(performs) else 0
         performs[performs_idx].click()
 
     def choose_ticket(self):
         tickets = self.available_tickets
         if not len(tickets):
-            raise StateError("暂无可售票")
-        ticket_idx = self.ticket if len(tickets) <= self.perform + 1 else 0
+            raise NoTicketsError("暂无可售票")
+        ticket_idx = self.ticket if self.perform < len(tickets) else 0
         tickets[ticket_idx].click()
 
     def choose_ticket_num(self):
@@ -252,6 +274,14 @@ class SelectPage(_Page):
         if current_num > expect_num:
             for _ in range(current_num - expect_num):
                 self.selector(resourceId=self.Resource.SubTicketButton).click()
+        # 无票判断
+        current_num = self.current_ticket_number
+        if expect_num != current_num:
+            raise NoTicketsError(f"没有足够票额，当前票数: {current_num}")
+
+    def back(self):
+        self.selector(resourceId=self.Resource.BackButton).click()
+        return SellPage(self.device)
 
 
 class BuyPage(_Page):
@@ -268,6 +298,7 @@ class BuyPage(_Page):
         Checkbox = damai_id("checkbox")
         Dialog = damai_id("damai_theme_dialog_layout")
         DialogConfirmButton = damai_id("damai_theme_dialog_confirm_btn")
+        BackButton = damai_id("title_back_btn")
 
     def set_need_choose_audiences(self, need_choose: bool):
         self.need_choose_audiences = need_choose
@@ -282,7 +313,7 @@ class BuyPage(_Page):
     @property
     def chosen_users(self):
         if not len(self.audiences):
-            return None
+            raise StateError("未设置购票人")
         xpath = (
             f'//*[@resource-id="{self.Resource.AudiencesLayout}"]'
             + "//*["
@@ -302,11 +333,10 @@ class BuyPage(_Page):
 
     def choose_audiences(self):
         checkboxs = self.chosen_users
-        if checkboxs is None:
-            raise StateError("无需选择用户")
         if len(checkboxs) != len(self.audiences):
             raise StateError("发现未知购票人，请先在应用中填好购票人信息")
         for checkbox in checkboxs:
+            # FIXME: 这里点击可能会失败,暂不知道原因
             if checkbox.attrib["checked"] != "true":
                 checkbox.click()
 
@@ -315,55 +345,99 @@ class BuyPage(_Page):
         if dialog.exists():
             dialog.child_selector(resourceId=self.Resource.DialogConfirmButton).click()
 
-    def confirm(self):
+    def confirm(self, max_retries=MAX_RETRIES):
         self.choose_audiences()
         pay_page = PayPage(self.device)
-        ticket_bought = False
-        while not ticket_bought:
+        for _ in range(max_retries):
             self.confirm_button.wait()
             self.confirm_button.click()
-            if pay_page.wait(0.1):
-                ticket_bought = True
-            else:
-                self.skip_popup()
-        return pay_page
+            for _ in range(max_retries):
+                if pay_page.wait(0.1):
+                    return pay_page
+                elif self.dialog.wait(exists=True, timeout=0.1):
+                    self.skip_popup()
+                    break
+        raise MaxReretriesError("购票失败, 超过最大重试次数")
+
+    def back(self):
+        self.selector(resourceId=self.Resource.BackButton).click()
+        return SelectPage(self.device)
 
 
 class PayPage(_Page):
     name = "支付"
 
     def wait(self, timeout: None | float = None) -> bool:
-        res = self.selector(resourceId="com.alipay.android.app:id/flybird_layout").wait(exists=True, timeout=timeout)
-        if res:
-            print("抢票成功")
-            return True
-        return False
+        return self.selector(resourceId="com.alipay.android.app:id/flybird_layout").wait(exists=True, timeout=timeout)
 
 
-def run(audiences: list[str]):
+def run(
+    audiences: list[str], available_perform_idx: int = 0, available_ticket_idx: int = 0, max_retries: int = MAX_RETRIES
+):
     device = u2.connect()
     sell_page = SellPage(device=device)
+    print("售票程序已开启：请手动转跳到演唱会售票页面")
     sell_page.wait()
-    sell_page.wait_for_sell()
-    select_page = sell_page.confirm()
-    select_page.wait()
-    select_page.set_perform(0)
-    select_page.set_available_ticket(0)
-    select_page.set_ticket_number(len(audiences))
-    select_page.choose_perform()
-    select_page.choose_ticket()
-    select_page.choose_ticket_num()
-    buy_page = select_page.confirm()
-    # buy_page = BuyPage(device=device)
-    buy_page.wait()
-    buy_page.set_audiences(audiences)
-    buy_page.confirm()
+    print(f"===\t{sell_page.title}\t===")
+    # 等待起售
+    select_page = _wait_for_sell(sell_page)
+    buy_page = _select_perform_and_ticket(
+        select_page,
+        ticket_number=len(audiences),
+        available_perform_idx=available_perform_idx,
+        available_ticket_idx=available_ticket_idx,
+    )
+    while True:
+        # 选票并跳转到购票界面
+        buy_page.set_audiences(audiences)
+        buy_page.wait()
+        try:
+            # 购票信息填入并尝试购买
+            pay_page = buy_page.confirm(max_retries)
+            break
+        except MaxReretriesError:
+            print("多次购买后失败，重新选票")
+            select_page = buy_page.back()
+            buy_page = _select_perform_and_ticket(
+                select_page,
+                ticket_number=len(audiences),
+                available_perform_idx=available_perform_idx,
+                available_ticket_idx=available_ticket_idx,
+            )
+    pay_page.wait()
+    print("购买成功")
+
+
+def _wait_for_sell(page: SellPage):
+    page.wait()
+    page.wait_for_sell()
+    return page.confirm()
+
+
+def _select_perform_and_ticket(
+    select_page: SelectPage, ticket_number: int, available_perform_idx: int = 0, available_ticket_idx: int = 0
+):
+    while True:
+        select_page.wait()
+        select_page.set_perform(available_perform_idx)
+        select_page.set_available_ticket(available_ticket_idx)
+        select_page.set_ticket_number(ticket_number)
+        try:
+            return select_page.confirm()
+        except NoTicketsError:
+            print("未找到合适票型")
+            sell_page = select_page.back()
+            sell_page.wait()
+            select_page = sell_page.confirm()
 
 
 @click.command
 @click.argument("audiences", nargs=-1, required=True)
-def cli(audiences: tuple[str, ...]):
-    run(audiences=list(audiences))
+@click.option("--perform", "-p", default=0, help="选择可选的演唱会场次序号")
+@click.option("--ticket", "-t", default=0, help="选择可选的演唱会标记序号")
+@click.option("--max-retries", "-m", default=MAX_RETRIES, help="选择最大重试次数")
+def cli(audiences: tuple[str, ...], perform: int, ticket: int, max_retries):
+    run(audiences=list(audiences), available_perform_idx=perform, available_ticket_idx=ticket, max_retries=max_retries)
 
 
 if __name__ == "__main__":
