@@ -1,0 +1,64 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.script }} on ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest]
+        script:
+          - name: damai
+            entry: src/autogui/bin/damai.py
+            spec: damai.spec
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Build with PyInstaller
+        run: uv run pyinstaller ${{ matrix.script.spec }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.script.name }}-${{ matrix.os }}
+          path: dist/${{ matrix.script.name }}/
+
+      - name: Create release and upload assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $asset = "dist/${{ matrix.script.name }}/${{ matrix.script.name }}.exe"
+
+          # Compress to ZIP for clean download
+          Compress-Archive -Path "dist/${{ matrix.script.name }}/*" -DestinationPath "${{ matrix.script.name }}-windows-$tag.zip"
+
+          gh release view "$tag" --json id 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create "$tag" --title "$tag" --generate-notes
+          }
+
+          gh release upload "$tag" "${{ matrix.script.name }}-windows-$tag.zip" --clobber
