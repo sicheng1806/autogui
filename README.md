@@ -4,6 +4,14 @@
 
 ## 环境部署
 
+0. 克隆项目到本地
+
+```sh
+git clone https://github.com/sicheng1806/autogui.git
+```
+
+如果没有`git`工具需要先下载[git](https://git-scm.com/)工具。
+
 1. 首先先下载项目管理工具[uv](https://uv.doczh.com/getting-started/installation/#__tabbed_1_2)
 
 **windows**
